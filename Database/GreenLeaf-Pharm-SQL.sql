@@ -5993,3 +5993,325 @@ BEGIN
 END
 GO 
 
+/* FUNCTION: Predict sale for each product in a category */
+/* Status code 
+ * 200 OK
+ * 404 Not found
+ * 400 Bad data
+ */
+CREATE OR ALTER FUNCTION fn_HoltWintersByCategory
+(
+    @Ten_danh_muc                       NVARCHAR(30),
+    @Data_smoothing_factor              FLOAT, -- Alpha in [0, 1]
+    @Trend_smoothing_factor             FLOAT, -- Beta* in [0, 1]
+    @Seasonal_change_smoothing_factor   FLOAT, -- Gamma = Gamma* (1 - Alpha) and Gamma* in [0, 1]
+    @Season_length                      INT, -- a year for this particular func. (annually)
+    @Next_period                        INT -- How many periods from now need to forcast
+)
+RETURNS @Results TABLE
+(
+    Ma_san_pham     MA_TYPE         PRIMARY KEY,
+    Ten_san_pham    NVARCHAR(50),
+    Forecast_next   FLOAT,
+    Final_level     FLOAT,
+    Final_trend     FLOAT,
+    Status_code     INT             DEFAULT 200,
+    Msg             VARCHAR(100)    DEFAULT 'Successfull'
+)
+AS
+BEGIN
+    -- Validate inputs
+    IF @Ten_danh_muc IS NULL
+    BEGIN
+        INSERT INTO @Results VALUES ('000000000', NULL, NULL, NULL, NULL, 404, 'Category not found');
+        RETURN;
+    END
+
+    IF @Data_smoothing_factor < 0 OR @Data_smoothing_factor > 1 OR 
+       @Trend_smoothing_factor < 0 OR @Trend_smoothing_factor > 1 OR 
+       @Seasonal_change_smoothing_factor < 0 OR @Seasonal_change_smoothing_factor > 1
+    BEGIN
+        INSERT INTO @Results VALUES ('000000000', NULL, NULL, NULL, NULL, 400, 'Invalid factor');
+        RETURN;
+    END
+
+    IF @Season_length < 2
+    BEGIN
+        INSERT INTO @Results VALUES ('000000000', NULL, NULL, NULL, NULL, 400, 'Not enough length');
+        RETURN;
+    END
+
+    IF @Next_period < 0
+    BEGIN
+        INSERT INTO @Results VALUES ('000000000', NULL, NULL, NULL, NULL, 400, 'Invalid future point');
+        RETURN;
+    END
+
+    DECLARE @Prods TABLE 
+    (
+        Ma_san_pham     MA_TYPE         PRIMARY KEY, 
+        Ten_san_pham    NVARCHAR(50)    NOT NULL
+    );
+
+    -- Recursive to get category + all descendants
+    -- assume: the number of recursion levels does not exceed default 100
+    WITH CATEGORIES AS
+    (
+        SELECT Ten AS Ten_danh_muc
+        FROM DANH_MUC
+        WHERE Ten LIKE @Ten_danh_muc
+
+        UNION ALL
+
+        SELECT CUR_CATE.Ten
+        FROM DANH_MUC AS CUR_CATE
+            JOIN CATEGORIES AS PRE_CAT 
+                ON CUR_CATE.Ten_danh_muc_cha LIKE PRE_CAT.Ten_danh_muc
+    )
+
+    -- Get all statisticated prods
+    INSERT INTO @Prods(Ma_san_pham, Ten_san_pham)
+    SELECT DISTINCT PROD.Ma_so_san_pham, PROD.Ten_san_pham
+    FROM SAN_PHAM AS PROD
+    WHERE PROD.Ten_danh_muc IN (SELECT Ten_danh_muc FROM CATEGORIES);
+
+    -- If cate not exist, or no products found:
+    IF NOT EXISTS(SELECT 1 FROM @Prods)
+    BEGIN
+        INSERT INTO @Results VALUES ('000000000', NULL, NULL, NULL, NULL, 404, 'Empty category');
+        RETURN;
+    END
+
+    -- Cursor: iterate products
+    DECLARE prod_cur CURSOR FOR
+    SELECT DISTINCT Ma_san_pham, Ten_san_pham 
+    FROM @Prods 
+    ORDER BY Ma_san_pham;
+
+    DECLARE @p_id   MA_TYPE, 
+            @p_name NVARCHAR(50);
+
+    OPEN prod_cur;
+    FETCH NEXT FROM prod_cur INTO @p_id, @p_name;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        INSERT INTO @Results(Ma_san_pham, Ten_san_pham, Forecast_next, Final_level, Final_trend, Status_code, Msg)
+        SELECT @p_id, @p_name, 
+               SINGLE.Forecast_next, SINGLE.Final_level, SINGLE.Final_trend, 
+               SINGLE.Status_code, SINGLE.Msg
+        FROM fn_HoltWintersSingleProduct(
+            @p_id, @Data_smoothing_factor, 
+            @Trend_smoothing_factor, 
+            @Seasonal_change_smoothing_factor, 
+            @Season_length,
+            @Next_period
+        ) AS SINGLE;
+
+        FETCH NEXT FROM prod_cur INTO @p_id, @p_name;
+    END
+
+    CLOSE prod_cur;
+    DEALLOCATE prod_cur;
+
+    RETURN;
+END
+GO
+
+/* FUNCTION: Predict sale for a particular product */
+/* Status code 
+ * 200 OK
+ * 404 Not found
+ * 400 Bad data
+ */
+CREATE OR ALTER FUNCTION fn_HoltWintersSingleProduct
+(
+    @Ma_san_pham    MA_TYPE,
+    @alpha          FLOAT, 
+    @beta           FLOAT, -- beta*
+    @gamma          FLOAT, -- gamma*
+    @m              INT, -- season length  
+    @h              INT -- period to forcast
+)
+RETURNS @Results TABLE
+(
+    Ma_san_pham         MA_TYPE         PRIMARY KEY,
+    Forecast_next       FLOAT,
+    Final_level         FLOAT,
+    Final_trend         FLOAT,
+    Status_code         INT             DEFAULT 200,
+    Msg                 VARCHAR(100)    DEFAULT 'Successfull'
+)
+AS
+BEGIN  
+    -- Validate parameters
+    IF @Ma_san_pham IS NULL OR
+       NOT EXISTS (
+            SELECT 1 
+            FROM SAN_PHAM 
+            WHERE Ma_so_san_pham = @Ma_san_pham
+        )
+    BEGIN
+        INSERT INTO @Results VALUES (NULL, NULL, NULL, NULL, 400, 'Product not found');
+        RETURN;
+    END
+
+    IF @alpha < 0 OR @alpha > 1 OR 
+       @beta < 0 OR @beta > 1 OR 
+       @gamma < 0 OR @gamma > 1 
+    BEGIN
+        INSERT INTO @Results VALUES (@Ma_san_pham, NULL, NULL, NULL, 400, 'Invalid factor');
+        RETURN;
+    END
+
+    IF @m < 2
+    BEGIN
+        INSERT INTO @Results VALUES (@Ma_san_pham, NULL, NULL, NULL, 400, 'Not enough length');
+        RETURN;
+    END
+
+    IF @h < 0
+    BEGIN
+        INSERT INTO @Results VALUES (@Ma_san_pham, NULL, NULL, NULL, 400, 'Invalid future point');
+        RETURN;
+    END
+
+    -- Load historical aggregated demand per period (monthly)
+    -- Period ordering uses Year + Month
+    DECLARE @Demand TABLE
+    (
+        PeriodID    INT IDENTITY(1, 1)  PRIMARY KEY,
+        Year_num    INT,
+        Month_num   INT,
+        y           FLOAT -- Total sold
+    );
+
+    INSERT INTO @Demand(Year_num, Month_num, y)
+    SELECT 
+        YEAR(DH.Thoi_gian_dat_hang),
+        MONTH(DH.Thoi_gian_dat_hang),
+        SUM(GSD.So_luong)
+    FROM GOM_SP_DH AS GSD
+        JOIN DON_HANG AS DH ON GSD.Ma_don_hang = DH.Ma_don_hang
+    WHERE GSD.Ma_san_pham = @Ma_san_pham AND
+          DH.Trang_thai_don_hang = 3
+    GROUP BY MONTH(DH.Thoi_gian_dat_hang), YEAR(DH.Thoi_gian_dat_hang);
+
+    -- If not enough data
+    IF @m + 1 > (SELECT COUNT(1) FROM @Demand)
+    BEGIN
+        INSERT INTO @Results VALUES (@Ma_san_pham, NULL, NULL, NULL, 400, 'Not enough data');
+        RETURN;
+    END
+
+    -- Declare and Initialize Level - l, Trend - b, Seasonal array - s (first season warm-up)
+    DECLARE @l FLOAT = 0.0, @b FLOAT = 0.0, @y FLOAT,
+    -- Temp table for seasonality, indexed 1..SeasonLength
+            @Sum_first_season FLOAT = 0.0;
+    DECLARE @Season TABLE (Pos INT PRIMARY KEY, s FLOAT);
+
+    -- sum first season
+    DECLARE @i INT = 1;
+    WHILE @i <= @m
+    BEGIN
+        SELECT @y = y FROM @Demand WHERE PeriodID = @i;
+        SET @Sum_first_season = @Sum_first_season + ISNULL(@y, 0);
+        INSERT INTO @Season(Pos, s) VALUES(@i, ISNULL(@y, 0) ); -- store raw for now
+        SET @i += 1;
+    END
+
+    -- HEURISTIC INITIALIZATION
+    -- to be more precise => optimize Error
+
+    -- Initial l = AVG(y) = 1/m * SUM(y) = l_m (of 1st season)
+    SET @l = @Sum_first_season / (1.00*@m);
+
+    -- initialize seasonality as additive deviations: s = y - l_m
+    UPDATE @Season
+    SET s = s - @l
+
+    -- initialize trend as average change between first two seasons if possible
+    -- additionally, can use derivative of the last 2 y's in the 1st season?
+    DECLARE @Sum_season_1 FLOAT = 0.0, @Sum_season_2 FLOAT = 0.0, @Half INT;
+    SET @Half = @m / 2; -- at least @Half = 1 cz @m >= 2 preservation
+    IF @Half < 1 SET @Half = 1;
+
+    SELECT @Sum_season_1 = SUM(y) FROM @Demand WHERE PeriodID BETWEEN 1 AND @Half;
+    SELECT @Sum_season_2 = SUM(y) FROM @Demand WHERE PeriodID BETWEEN @Half+1 AND @m;
+
+    SET @b = (@Sum_season_2 - @Sum_season_1) / (1.0*@Half);
+
+    -- Cursor iterate subsequent periods (from SeasonLength+1 ... N)
+    --    Recurrence (additive):
+    --      l_t = alpha*(y_t - s_{t-m}) + (1-alpha)*(l_{t-1} + b_{t-1})
+    --      b_t = beta*(l_t - l_{t-1}) + (1-beta)*b_{t-1}
+    --      s_t = gamma*(y_t - l_t) + (1-gamma)*S_{t-m}
+
+    DECLARE @PeriodID   INT = 1;
+    DECLARE @Prev_l     FLOAT = @l;
+    DECLARE @Prev_b     FLOAT = @b;
+    DECLARE @Prev_s     FLOAT = 0.0;
+
+    -- sorted from past to present
+    DECLARE cur_demand CURSOR FOR
+    SELECT PeriodID, y
+    FROM @Demand
+    ORDER BY PeriodID ASC;
+
+    OPEN cur_demand;
+    FETCH NEXT FROM cur_demand INTO @PeriodID, @y;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF @PeriodID > @m
+        BEGIN
+            -- seasonal position to use is (PeriodID - SeasonLength
+            -- (@PeriodID - 1) to support, for ex, 24th month => 12th month,
+            -- instead of 24%12 = 0, convert 0 => 12th month
+            DECLARE @Prev_pos INT = ( (@PeriodID - 1) % @m) + 1;
+            SELECT @Prev_s = s FROM @Season WHERE Pos = @Prev_pos;
+
+            -- compute new level and trend
+            SET @Prev_l = @l;
+            SET @Prev_b = @b;
+
+            SET @l = @alpha * (@y - ISNULL(@Prev_s, 0) ) + (1 - @alpha) * (@Prev_l + @Prev_b);
+            SET @b = @beta * (@l - @Prev_l) + (1 - @beta) * @Prev_b;
+
+            -- update seasonal for current position
+            UPDATE @Season
+            SET s = @gamma * (@y - @l) + (1 - @gamma) * ISNULL(@Prev_s, 0)
+            WHERE Pos = @Prev_pos;
+        END
+        
+        FETCH NEXT FROM cur_demand INTO @PeriodID, @y;
+    END
+
+    CLOSE cur_demand;
+    DEALLOCATE cur_demand;
+
+    -- Forecast next period
+    -- forcastedY_{t + h | t} = l_t + h*b_t + s_{t + h - m*(k + 1)}
+    -- k = int( (h - 1)/m)
+    -- calculate k
+    DECLARE @k INT = FLOOR( (@h - 1)/(1.0*@m) );
+    -- find the last period index in the most recent season
+    DECLARE @Last_periodID INT = (SELECT MAX(PeriodID) FROM @Demand);
+    DECLARE @s_id INT = @Last_periodID + @h - @m*(@k + 1);
+    -- This check to ensure s_id is in the prev season => can find in @Season
+    IF @s_id < @Last_periodID - @m + 1
+    BEGIN
+        INSERT INTO @Results VALUES (@Ma_san_pham, NULL, NULL, NULL, 400, 'Invalid future point calculation');
+        RETURN;
+    END
+    -- @Season only capture the most recent season 
+    -- => need f: s_id -> period_id, with period_id in [1, 12]
+    DECLARE @Next_pos INT = ( (@s_id - 1) % @m) + 1;
+
+    DECLARE @S_next FLOAT = (SELECT S FROM @Season WHERE Pos = @Next_pos);
+    DECLARE @Forecast FLOAT = (@l + @h*@b) + ISNULL(@S_next, 0);
+
+    INSERT INTO @Results VALUES (@Ma_san_pham, @Forecast, @l, @b, 200, 'Successful');
+    RETURN;
+END
+GO
