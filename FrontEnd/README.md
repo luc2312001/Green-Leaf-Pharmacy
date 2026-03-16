@@ -1,7 +1,5 @@
 # Login Page in React.js
 
-![login in react](https://github.com/Kuzma02/Login-Page-In-React.js/assets/138793624/2b569c7a-6006-4d10-89e4-5f7ad58203ad)
-
 # Overview
 This repository contains a simple and elegant login page built with React.js. It demonstrates the use of modern React practices and is designed to be both responsive and user-friendly.
 
