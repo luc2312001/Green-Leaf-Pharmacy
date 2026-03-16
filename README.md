@@ -36,4 +36,4 @@ Nevertheless, it still provides basic functionallity as
   
   4. Product's management for Admind (CRUD) (*We can not be sure if this functionality is yet brought over*)
 
-  ![crud](assets/crud.jpg)
+  ![crud](assets/CRUD.jpg)
