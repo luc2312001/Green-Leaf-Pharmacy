@@ -24,9 +24,16 @@ However "completion" in this context is to complete the HCMUT's project. The aut
 Nevertheless, it still provides basic functionallity as
   1. Login
 
+  ![login-page](assets/login-page.jpg)
+
   2. Product's page / find project you need
 
+  ![product-page](assets/product-page.jpg)
+
   3. Project's detail page
+
+  ![product-detail](assets/product-detail.jpg)
   
   4. Product's management for Admind (CRUD) (*We can not be sure if this functionality is yet brought over*)
 
+  ![crud](assets/crud.jpg)
